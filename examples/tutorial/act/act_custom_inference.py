@@ -15,8 +15,6 @@
 
 조작
   <- / ->  : 좌/우 회전 (3도씩, 최대 +-30도)
-  R        : 리플레이 시작 (녹화된 데이터 재생)
-  T        : 리플레이 중단
   I        : 추론 시작 (학습된 모델로 자동 제어)
   J        : 추론 중단
   ESC / Q  : 종료
@@ -40,7 +38,6 @@ import mujoco
 import torch
 
 from lerobot.configs.types import FeatureType, PolicyFeature
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.act.modeling_act import ACTPolicy
 
@@ -275,21 +272,13 @@ def main() -> None:
     next_infer_time = 0.0
     infer_step_count = 0
 
-    # ── 리플레이 상태 ───────────────────────────────────────
-    is_replaying = False
-    replay_actions = None       # 리플레이할 액션 리스트
-    replay_frame_idx = 0        # 현재 리플레이 프레임 인덱스
-    replay_total_frames = 0     # 리플레이 총 프레임 수
-    replay_episode_idx = 0      # 현재 리플레이 에피소드 인덱스
-    replay_num_episodes = 0     # 리플레이 총 에피소드 수
-
     # 루프 변수
     target_angle  = 0.0
     vid_interval  = 1.0 / vid_fps
     next_vid_time = time.monotonic()   # 즉시 첫 프레임
     current_bgr   = None               # 최신 비디오 프레임 (BGR)
 
-    print("\n[조작]  <- -> : 회전  |  R : 리플레이  |  T : 리플레이 중단  |  I : 추론  |  J : 추론중단  |  ESC/Q : 종료\n")
+    print("\n[조작]  <- -> : 회전  |  I : 추론  |  J : 추론중단  |  ESC/Q : 종료\n")
 
     while True:
         # 키 입력 (non-blocking)
@@ -300,34 +289,8 @@ def main() -> None:
             target_angle = max(-MAX_ANGLE, target_angle - ANGLE_STEP)
         elif key in (2555904, 65363, 83):   # -> 오른쪽
             target_angle = min(MAX_ANGLE,  target_angle + ANGLE_STEP)
-        elif key in (ord('r'), ord('R')):
-            if not is_replaying:
-                # 데이터셋 존재 여부 확인 후 로드
-                replay_data_dir = os.path.join(DATASET_ROOT, "data")
-                if os.path.isdir(replay_data_dir):
-                    replay_ds = LeRobotDataset(DATASET_REPO_ID, root=DATASET_ROOT)
-                    replay_num_episodes = replay_ds.meta.total_episodes
-                    if replay_num_episodes > 0:
-                        replay_episode_idx = 0
-                        ep_frames = replay_ds.hf_dataset.filter(
-                            lambda x: x["episode_index"] == replay_episode_idx
-                        )
-                        replay_actions = ep_frames.select_columns("action")
-                        replay_total_frames = len(replay_actions)
-                        replay_frame_idx = 0
-                        is_replaying = True
-                        print(f"[REPLAY] 시작 — 에피소드 {replay_episode_idx}/{replay_num_episodes} ({replay_total_frames} frames)")
-                    else:
-                        print("[REPLAY] 데이터셋에 에피소드가 없습니다.")
-                else:
-                    print(f"[REPLAY] 녹화된 데이터가 없습니다: {DATASET_ROOT}")
-        elif key in (ord('t'), ord('T')):
-            if is_replaying:
-                is_replaying = False
-                replay_actions = None
-                print("[REPLAY] 중단")
         elif key in (ord('i'), ord('I')):
-            if not is_inferring and not is_replaying:
+            if not is_inferring:
                 # 모델 로드
                 if not os.path.isdir(MODEL_PATH):
                     print(f"[INFER] 모델 경로 없음: {MODEL_PATH}")
@@ -371,28 +334,6 @@ def main() -> None:
                 infer_policy = None
                 infer_frame_buffer.clear()
                 print("[INFER] 추론 중단")
-
-        # ── 리플레이: 액션 적용 ──────────────────────────────
-        if is_replaying and replay_actions is not None:
-            if replay_frame_idx < replay_total_frames:
-                action_val = replay_actions[replay_frame_idx]["action"]
-                target_angle = float(action_val.item()) if action_val.dim() == 0 else float(action_val[0])
-                replay_frame_idx += 1
-            else:
-                # 현재 에피소드 완료 → 다음 에피소드 시도
-                replay_episode_idx += 1
-                if replay_episode_idx < replay_num_episodes:
-                    ep_frames = replay_ds.hf_dataset.filter(
-                        lambda x, eidx=replay_episode_idx: x["episode_index"] == eidx
-                    )
-                    replay_actions = ep_frames.select_columns("action")
-                    replay_total_frames = len(replay_actions)
-                    replay_frame_idx = 0
-                    print(f"[REPLAY] 다음 에피소드 {replay_episode_idx}/{replay_num_episodes} ({replay_total_frames} frames)")
-                else:
-                    is_replaying = False
-                    replay_actions = None
-                    print("[REPLAY] 모든 에피소드 재생 완료")
 
         # 관절 부드러운 추종
         cur = data.qpos[pan_id]
@@ -463,14 +404,9 @@ def main() -> None:
 
         # 레이블
         deg = math.degrees(data.qpos[pan_id])
-        if is_inferring:
-            status = f"  [INFER step={infer_step_count}]"
-        elif is_replaying:
-            status = f"  [REPLAY {replay_frame_idx}/{replay_total_frames} ep{replay_episode_idx}]"
-        else:
-            status = ""
+        status = f"  [INFER step={infer_step_count}]" if is_inferring else ""
         label(world_bgr, f"World View  |  Pan: {deg:+.1f} deg{status}")
-        label(cam_bgr,   "Camera View  |  [<- ->] [R]Replay [T]Stop [I]Infer [J]Stop [Q]Quit")
+        label(cam_bgr,   "Camera View  |  [<- ->] [I]Infer [J]Stop [Q]Quit")
 
         # 화면 표시
         cv2.imshow("Camera Turret - MuJoCo",
