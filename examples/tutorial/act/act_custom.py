@@ -32,16 +32,17 @@ import math
 import os
 import shutil
 import time
+from collections import deque
 
 import cv2
 import numpy as np
 import mujoco
 import torch
 
+from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.datasets.utils import dataset_to_policy_features
+from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.act.modeling_act import ACTPolicy
-from lerobot.policies.factory import make_pre_post_processors
 
 # ─── 경로 / 크기 설정 ───────────────────────────────────────────
 VIDEO_PATH = "examples/tutorial/act/play.mp4"
@@ -75,7 +76,7 @@ DATASET_FEATURES = {
     "action": {
         "dtype": "float32",
         "shape": (1,),
-        "names": ["pan_target"],
+        "names": ["delta_angle"],
     },
 }
 # ────────────────────────────────────────────────────────────────
@@ -310,17 +311,19 @@ def main() -> None:
     frame_count = 0
     rec_interval = 1.0 / DATASET_FPS
     next_rec_time = 0.0
+    # 레코딩용 각도 버퍼: 2프레임 전 각도를 기억하여 delta 계산
+    rec_angle_buffer = deque(maxlen=3)  # [N-2, N-1, N] 각도
 
     logging.info(f"Dataset initialized: {DATASET_ROOT}")
 
     # ── 추론 상태 ────────────────────────────────────────────
     is_inferring = False
     infer_policy = None
-    infer_preprocessor = None
-    infer_postprocessor = None
     infer_device = None
+    infer_frame_buffer = deque(maxlen=3)  # 최근 3프레임 (N-2, N-1, N) 이미지
     infer_interval = 1.0 / INFERENCE_FPS
     next_infer_time = 0.0
+    infer_step_count = 0
 
     # 루프 변수
     target_angle  = 0.0
@@ -343,6 +346,7 @@ def main() -> None:
             if not is_recording:
                 is_recording = True
                 frame_count = 0
+                rec_angle_buffer.clear()
                 next_rec_time = time.monotonic()
                 print(f"[REC] 레코딩 시작 (에피소드 {episode_count}, {DATASET_FPS}fps)")
         elif key in (ord('e'), ord('E')):
@@ -357,35 +361,54 @@ def main() -> None:
                     print("[REC] 레코딩 종료 — 프레임 없음, 저장 안 함")
         elif key in (ord('i'), ord('I')):
             if not is_inferring:
-                try:
-                    if infer_policy is None:
-                        print(f"[INF] 모델 로딩 중: {MODEL_PATH}")
-                        if torch.cuda.is_available():
-                            infer_device = torch.device("cuda")
-                        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                            infer_device = torch.device("mps")
+                if not os.path.isdir(MODEL_PATH):
+                    print(f"[INF] 모델 경로 없음: {MODEL_PATH}")
+                else:
+                    try:
+                        if infer_policy is None:
+                            print(f"[INF] 모델 로딩 중: {MODEL_PATH}")
+                            if torch.cuda.is_available():
+                                infer_device = torch.device("cuda")
+                            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                                infer_device = torch.device("mps")
+                            else:
+                                infer_device = torch.device("cpu")
+                            # 학습 시 사용한 피처 정의 재구성
+                            img_c, img_h, img_w = 3, VIEW_H, VIEW_W
+                            state_dim = 1
+                            inf_input_features = {
+                                "observation.images.cam_t0": PolicyFeature(type=FeatureType.VISUAL, shape=(img_c, img_h, img_w)),
+                                "observation.images.cam_t1": PolicyFeature(type=FeatureType.VISUAL, shape=(img_c, img_h, img_w)),
+                                "observation.images.cam_t2": PolicyFeature(type=FeatureType.VISUAL, shape=(img_c, img_h, img_w)),
+                                "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(state_dim,)),
+                            }
+                            inf_output_features = {
+                                "action": PolicyFeature(type=FeatureType.ACTION, shape=(state_dim,)),
+                            }
+                            inf_cfg = ACTConfig(
+                                input_features=inf_input_features,
+                                output_features=inf_output_features,
+                                chunk_size=1,
+                                n_action_steps=1,
+                            )
+                            infer_policy = ACTPolicy(inf_cfg)
+                            infer_policy.load_state_dict(ACTPolicy.from_pretrained(MODEL_PATH).state_dict())
+                            infer_policy.eval()
+                            infer_policy.to(infer_device)
+                            print(f"[INF] 모델 로드 완료 (device={infer_device})")
                         else:
-                            infer_device = torch.device("cpu")
-                        infer_policy = ACTPolicy.from_pretrained(MODEL_PATH)
-                        infer_policy.to(infer_device)
-                        infer_policy.eval()
-                        ds_meta = LeRobotDatasetMetadata(DATASET_REPO_ID, root=DATASET_ROOT)
-                        infer_preprocessor, infer_postprocessor = make_pre_post_processors(
-                            infer_policy.config,
-                            pretrained_path=MODEL_PATH,
-                            dataset_stats=ds_meta.stats,
-                        )
-                        print(f"[INF] 모델 로드 완료 (device={infer_device})")
-                    else:
-                        infer_policy.reset()
-                    is_inferring = True
-                    next_infer_time = time.monotonic()
-                    print("[INF] 추론 시작")
-                except Exception as e:
-                    print(f"[INF] 모델 로드 실패: {e}")
+                            infer_policy.reset()
+                        infer_frame_buffer.clear()
+                        infer_step_count = 0
+                        is_inferring = True
+                        next_infer_time = time.monotonic()
+                        print("[INF] 추론 시작")
+                    except Exception as e:
+                        print(f"[INF] 모델 로드 실패: {e}")
         elif key in (ord('j'), ord('J')):
             if is_inferring:
                 is_inferring = False
+                infer_frame_buffer.clear()
                 print("[INF] 추론 정지")
 
         # 관절 부드러운 추종
@@ -428,31 +451,47 @@ def main() -> None:
             if pts_cam is not None:
                 cam_bgr = composite_video(cam_bgr, pts_cam, current_bgr)
 
-        # ── 추론: 모델이 예측한 action으로 관절 제어 ────────
-        if is_inferring and now >= next_infer_time:
-            cam_rgb = cv2.cvtColor(cam_bgr, cv2.COLOR_BGR2RGB)
-            img_tensor = torch.from_numpy(cam_rgb).float().permute(2, 0, 1).unsqueeze(0).to(infer_device)
-            state_tensor = torch.tensor([[data.qpos[pan_id]]], dtype=torch.float32, device=infer_device)
-            obs_dict = {
-                "observation.images.cam": img_tensor,
-                "observation.state": state_tensor,
-            }
-            obs_batch = infer_preprocessor(obs_dict)
-            with torch.no_grad():
-                action = infer_policy.select_action(obs_batch)
-            action = infer_postprocessor(action)
-            pred_angle = action.squeeze().item()
-            target_angle = max(-MAX_ANGLE, min(MAX_ANGLE, pred_angle))
+        # ── 추론: 3프레임 시계열 이미지 + delta angle 예측 ──
+        if is_inferring and infer_policy is not None and now >= next_infer_time:
+            cam_rgb_infer = cv2.cvtColor(cam_bgr, cv2.COLOR_BGR2RGB)
+            cam_tensor = torch.from_numpy(cam_rgb_infer).float() / 255.0  # (H, W, C)
+            cam_tensor = cam_tensor.permute(2, 0, 1)  # (C, H, W)
+            infer_frame_buffer.append(cam_tensor)
+
+            # 3프레임이 모이면 추론 실행
+            if len(infer_frame_buffer) >= 3:
+                with torch.no_grad():
+                    frames = list(infer_frame_buffer)
+                    cur_angle = data.qpos[pan_id]
+                    batch_infer = {
+                        "observation.images.cam_t0": frames[0].unsqueeze(0).to(infer_device),
+                        "observation.images.cam_t1": frames[1].unsqueeze(0).to(infer_device),
+                        "observation.images.cam_t2": frames[2].unsqueeze(0).to(infer_device),
+                        "observation.state": torch.tensor([[cur_angle]], dtype=torch.float32).to(infer_device),
+                    }
+                    action = infer_policy.select_action(batch_infer)
+                    delta = float(action[0, 0].cpu())
+                    target_angle = max(-MAX_ANGLE, min(MAX_ANGLE, cur_angle + delta))
+                    infer_step_count += 1
+
             next_infer_time = now + infer_interval
 
         # ── 레코딩: 프레임 저장 (10fps 간격) ────────────────
         if is_recording and now >= next_rec_time:
-            # cam_bgr은 BGR이므로 RGB로 변환하여 저장
             cam_rgb = cv2.cvtColor(cam_bgr, cv2.COLOR_BGR2RGB)
+            cur_angle = float(data.qpos[pan_id])
+            rec_angle_buffer.append(cur_angle)
+
+            # delta angle 계산: N-2 시점이 있으면 state[N]-state[N-2], 없으면 0
+            if len(rec_angle_buffer) >= 3:
+                delta_angle = rec_angle_buffer[-1] - rec_angle_buffer[-3]
+            else:
+                delta_angle = 0.0
+
             frame_data = {
                 "observation.images.cam": cam_rgb,
-                "observation.state": np.array([data.qpos[pan_id]], dtype=np.float32),
-                "action": np.array([target_angle], dtype=np.float32),
+                "observation.state": np.array([cur_angle], dtype=np.float32),
+                "action": np.array([delta_angle], dtype=np.float32),
                 "task": SINGLE_TASK,
             }
             dataset.add_frame(frame_data)
@@ -463,7 +502,7 @@ def main() -> None:
         deg = math.degrees(data.qpos[pan_id])
         status = f"  [REC {frame_count}]" if is_recording else ""
         if is_inferring:
-            status += "  [INF]"
+            status += f"  [INF step={infer_step_count}]"
         label(world_bgr, f"World View  |  Pan: {deg:+.1f} deg{status}")
         label(cam_bgr,   "Camera View  |  [<- ->] [S]Rec [E]Stop [I]Infer [J]Stop [Q]Quit")
 

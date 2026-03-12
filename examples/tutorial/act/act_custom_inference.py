@@ -15,8 +15,10 @@
 
 조작
   <- / ->  : 좌/우 회전 (3도씩, 최대 +-30도)
-  S        : 레코딩 시작
-  E        : 레코딩 종료 (에피소드 저장)
+  R        : 리플레이 시작 (녹화된 데이터 재생)
+  T        : 리플레이 중단
+  I        : 추론 시작 (학습된 모델로 자동 제어)
+  J        : 추론 중단
   ESC / Q  : 종료
 
 비디오 합성 방식
@@ -28,14 +30,19 @@
 import logging
 import math
 import os
-import shutil
 import time
+
+from collections import deque
 
 import cv2
 import numpy as np
 import mujoco
+import torch
 
+from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.policies.act.configuration_act import ACTConfig
+from lerobot.policies.act.modeling_act import ACTPolicy
 
 # ─── 경로 / 크기 설정 ───────────────────────────────────────────
 VIDEO_PATH = "examples/tutorial/act/play.mp4"
@@ -45,29 +52,12 @@ VIEW_W, VIEW_H = 800, 450      # 각 뷰(world/cam) 렌더 크기
 ANGLE_STEP = math.radians(3)   # 키 1회 입력당 회전량
 MAX_ANGLE  = math.radians(30)  # 최대 회전 +-30도
 
-# ─── 레코딩 설정 ─────────────────────────────────────────────────
+# ─── 데이터셋 / 추론 설정 ────────────────────────────────────────
 DATASET_REPO_ID = "act_custom/cam_turret"
 DATASET_ROOT    = "outputs/act_custom_dataset"
 DATASET_FPS     = 10
-SINGLE_TASK     = "Rotate camera turret to track target"
-
-DATASET_FEATURES = {
-    "observation.images.cam": {
-        "dtype": "image",
-        "shape": (VIEW_H, VIEW_W, 3),
-        "names": ["height", "width", "channels"],
-    },
-    "observation.state": {
-        "dtype": "float32",
-        "shape": (1,),
-        "names": ["pan_angle"],
-    },
-    "action": {
-        "dtype": "float32",
-        "shape": (1,),
-        "names": ["pan_target"],
-    },
-}
+MODEL_PATH      = "outputs/act_custom_training"
+INFERENCE_FPS   = DATASET_FPS
 # ────────────────────────────────────────────────────────────────
 
 XML = """
@@ -276,32 +266,22 @@ def main() -> None:
     renderer.update_scene(data, camera="world_cam")
     renderer.render()   # GL 컨텍스트 초기화
 
-    # ── LeRobot 데이터셋 초기화 ─────────────────────────────
-    dataset_data_dir = os.path.join(DATASET_ROOT, "data")
-    dataset_meta_path = os.path.join(DATASET_ROOT, "meta", "info.json")
-    if os.path.exists(dataset_meta_path) and os.path.isdir(dataset_data_dir):
-        # 에피소드가 저장된 완전한 데이터셋 → 로드
-        dataset = LeRobotDataset(DATASET_REPO_ID, root=DATASET_ROOT)
-        logging.info(f"기존 데이터셋 로드: {dataset.meta.total_episodes} 에피소드")
-    else:
-        # 데이터셋이 없거나 불완전(에피소드 없음) → (재)생성
-        if os.path.exists(DATASET_ROOT):
-            shutil.rmtree(DATASET_ROOT)
-        dataset = LeRobotDataset.create(
-            repo_id=DATASET_REPO_ID,
-            fps=DATASET_FPS,
-            root=DATASET_ROOT,
-            robot_type="cam_turret",
-            features=DATASET_FEATURES,
-            use_videos=False,
-        )
-    is_recording = False
-    episode_count = dataset.meta.total_episodes
-    frame_count = 0
-    rec_interval = 1.0 / DATASET_FPS
-    next_rec_time = 0.0
+    # ── 추론 상태 ───────────────────────────────────────────
+    is_inferring = False
+    infer_policy = None
+    infer_device = None
+    infer_frame_buffer = deque(maxlen=3)   # 최근 3프레임 (N-2, N-1, N) RGB
+    infer_interval = 1.0 / INFERENCE_FPS
+    next_infer_time = 0.0
+    infer_step_count = 0
 
-    logging.info(f"Dataset initialized: {DATASET_ROOT}")
+    # ── 리플레이 상태 ───────────────────────────────────────
+    is_replaying = False
+    replay_actions = None       # 리플레이할 액션 리스트
+    replay_frame_idx = 0        # 현재 리플레이 프레임 인덱스
+    replay_total_frames = 0     # 리플레이 총 프레임 수
+    replay_episode_idx = 0      # 현재 리플레이 에피소드 인덱스
+    replay_num_episodes = 0     # 리플레이 총 에피소드 수
 
     # 루프 변수
     target_angle  = 0.0
@@ -309,7 +289,7 @@ def main() -> None:
     next_vid_time = time.monotonic()   # 즉시 첫 프레임
     current_bgr   = None               # 최신 비디오 프레임 (BGR)
 
-    print("\n[조작]  <- -> : 회전  |  S : 레코딩  |  E : 레코딩 종료  |  ESC/Q : 종료\n")
+    print("\n[조작]  <- -> : 회전  |  R : 리플레이  |  T : 리플레이 중단  |  I : 추론  |  J : 추론중단  |  ESC/Q : 종료\n")
 
     while True:
         # 키 입력 (non-blocking)
@@ -320,22 +300,99 @@ def main() -> None:
             target_angle = max(-MAX_ANGLE, target_angle - ANGLE_STEP)
         elif key in (2555904, 65363, 83):   # -> 오른쪽
             target_angle = min(MAX_ANGLE,  target_angle + ANGLE_STEP)
-        elif key in (ord('s'), ord('S')):
-            if not is_recording:
-                is_recording = True
-                frame_count = 0
-                next_rec_time = time.monotonic()
-                print(f"[REC] 레코딩 시작 (에피소드 {episode_count}, {DATASET_FPS}fps)")
-        elif key in (ord('e'), ord('E')):
-            if is_recording:
-                is_recording = False
-                if frame_count > 0:
-                    dataset.save_episode()
-                    print(f"[REC] 레코딩 종료 — 에피소드 {episode_count} 저장 ({frame_count} frames)")
-                    episode_count += 1
+        elif key in (ord('r'), ord('R')):
+            if not is_replaying:
+                # 데이터셋 존재 여부 확인 후 로드
+                replay_data_dir = os.path.join(DATASET_ROOT, "data")
+                if os.path.isdir(replay_data_dir):
+                    replay_ds = LeRobotDataset(DATASET_REPO_ID, root=DATASET_ROOT)
+                    replay_num_episodes = replay_ds.meta.total_episodes
+                    if replay_num_episodes > 0:
+                        replay_episode_idx = 0
+                        ep_frames = replay_ds.hf_dataset.filter(
+                            lambda x: x["episode_index"] == replay_episode_idx
+                        )
+                        replay_actions = ep_frames.select_columns("action")
+                        replay_total_frames = len(replay_actions)
+                        replay_frame_idx = 0
+                        is_replaying = True
+                        print(f"[REPLAY] 시작 — 에피소드 {replay_episode_idx}/{replay_num_episodes} ({replay_total_frames} frames)")
+                    else:
+                        print("[REPLAY] 데이터셋에 에피소드가 없습니다.")
                 else:
-                    dataset.clear_episode_buffer()
-                    print("[REC] 레코딩 종료 — 프레임 없음, 저장 안 함")
+                    print(f"[REPLAY] 녹화된 데이터가 없습니다: {DATASET_ROOT}")
+        elif key in (ord('t'), ord('T')):
+            if is_replaying:
+                is_replaying = False
+                replay_actions = None
+                print("[REPLAY] 중단")
+        elif key in (ord('i'), ord('I')):
+            if not is_inferring and not is_replaying:
+                # 모델 로드
+                if not os.path.isdir(MODEL_PATH):
+                    print(f"[INFER] 모델 경로 없음: {MODEL_PATH}")
+                else:
+                    if torch.cuda.is_available():
+                        infer_device = torch.device("cuda")
+                    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                        infer_device = torch.device("mps")
+                    else:
+                        infer_device = torch.device("cpu")
+                    # 학습 시 사용한 피처 정의 재구성
+                    img_c, img_h, img_w = 3, VIEW_H, VIEW_W
+                    state_dim = 1
+                    inf_input_features = {
+                        "observation.images.cam_t0": PolicyFeature(type=FeatureType.VISUAL, shape=(img_c, img_h, img_w)),
+                        "observation.images.cam_t1": PolicyFeature(type=FeatureType.VISUAL, shape=(img_c, img_h, img_w)),
+                        "observation.images.cam_t2": PolicyFeature(type=FeatureType.VISUAL, shape=(img_c, img_h, img_w)),
+                        "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(state_dim,)),
+                    }
+                    inf_output_features = {
+                        "action": PolicyFeature(type=FeatureType.ACTION, shape=(state_dim,)),
+                    }
+                    inf_cfg = ACTConfig(
+                        input_features=inf_input_features,
+                        output_features=inf_output_features,
+                        chunk_size=1,
+                        n_action_steps=1,
+                    )
+                    infer_policy = ACTPolicy(inf_cfg)
+                    infer_policy.load_state_dict(ACTPolicy.from_pretrained(MODEL_PATH).state_dict())
+                    infer_policy.eval()
+                    infer_policy.to(infer_device)
+                    infer_frame_buffer.clear()
+                    infer_step_count = 0
+                    next_infer_time = time.monotonic()
+                    is_inferring = True
+                    print(f"[INFER] 추론 시작 (모델: {MODEL_PATH}, device: {infer_device})")
+        elif key in (ord('j'), ord('J')):
+            if is_inferring:
+                is_inferring = False
+                infer_policy = None
+                infer_frame_buffer.clear()
+                print("[INFER] 추론 중단")
+
+        # ── 리플레이: 액션 적용 ──────────────────────────────
+        if is_replaying and replay_actions is not None:
+            if replay_frame_idx < replay_total_frames:
+                action_val = replay_actions[replay_frame_idx]["action"]
+                target_angle = float(action_val.item()) if action_val.dim() == 0 else float(action_val[0])
+                replay_frame_idx += 1
+            else:
+                # 현재 에피소드 완료 → 다음 에피소드 시도
+                replay_episode_idx += 1
+                if replay_episode_idx < replay_num_episodes:
+                    ep_frames = replay_ds.hf_dataset.filter(
+                        lambda x, eidx=replay_episode_idx: x["episode_index"] == eidx
+                    )
+                    replay_actions = ep_frames.select_columns("action")
+                    replay_total_frames = len(replay_actions)
+                    replay_frame_idx = 0
+                    print(f"[REPLAY] 다음 에피소드 {replay_episode_idx}/{replay_num_episodes} ({replay_total_frames} frames)")
+                else:
+                    is_replaying = False
+                    replay_actions = None
+                    print("[REPLAY] 모든 에피소드 재생 완료")
 
         # 관절 부드러운 추종
         cur = data.qpos[pan_id]
@@ -377,39 +434,49 @@ def main() -> None:
             if pts_cam is not None:
                 cam_bgr = composite_video(cam_bgr, pts_cam, current_bgr)
 
-        # ── 레코딩: 프레임 저장 (10fps 간격) ────────────────
-        if is_recording and now >= next_rec_time:
-            # cam_bgr은 BGR이므로 RGB로 변환하여 저장
-            cam_rgb = cv2.cvtColor(cam_bgr, cv2.COLOR_BGR2RGB)
-            frame_data = {
-                "observation.images.cam": cam_rgb,
-                "observation.state": np.array([data.qpos[pan_id]], dtype=np.float32),
-                "action": np.array([target_angle], dtype=np.float32),
-                "task": SINGLE_TASK,
-            }
-            dataset.add_frame(frame_data)
-            frame_count += 1
-            next_rec_time = now + rec_interval
+        # ── 추론: 프레임 버퍼에 저장 & 모델 실행 ─────────────
+        if is_inferring and infer_policy is not None and now >= next_infer_time:
+            # 카메라 뷰 이미지를 RGB float [0,1]로 변환하여 버퍼에 추가
+            cam_rgb_infer = cv2.cvtColor(cam_bgr, cv2.COLOR_BGR2RGB)
+            cam_tensor = torch.from_numpy(cam_rgb_infer).float() / 255.0  # (H, W, C)
+            cam_tensor = cam_tensor.permute(2, 0, 1)  # (C, H, W)
+            infer_frame_buffer.append(cam_tensor)
+
+            # 3프레임이 모이면 추론 실행
+            if len(infer_frame_buffer) >= 3:
+                with torch.no_grad():
+                    frames = list(infer_frame_buffer)  # [N-2, N-1, N] 각 (C, H, W)
+                    cur_angle = data.qpos[pan_id]
+                    batch_infer = {
+                        "observation.images.cam_t0": frames[0].unsqueeze(0).to(infer_device),
+                        "observation.images.cam_t1": frames[1].unsqueeze(0).to(infer_device),
+                        "observation.images.cam_t2": frames[2].unsqueeze(0).to(infer_device),
+                        "observation.state": torch.tensor([[cur_angle]], dtype=torch.float32).to(infer_device),
+                    }
+                    action = infer_policy.select_action(batch_infer)  # (1, action_dim)
+                    delta = float(action[0, 0].cpu())
+                    print(f"[INFER] delta={delta:.4f}, target_angle={target_angle:.4f}")
+                    target_angle = max(-MAX_ANGLE, min(MAX_ANGLE, cur_angle + delta))
+                    infer_step_count += 1
+
+            next_infer_time = now + infer_interval
 
         # 레이블
         deg = math.degrees(data.qpos[pan_id])
-        status = f"  [REC {frame_count}]" if is_recording else ""
+        if is_inferring:
+            status = f"  [INFER step={infer_step_count}]"
+        elif is_replaying:
+            status = f"  [REPLAY {replay_frame_idx}/{replay_total_frames} ep{replay_episode_idx}]"
+        else:
+            status = ""
         label(world_bgr, f"World View  |  Pan: {deg:+.1f} deg{status}")
-        label(cam_bgr,   "Camera View  |  [<- ->] [S]Rec [E]Stop [Q]Quit")
+        label(cam_bgr,   "Camera View  |  [<- ->] [R]Replay [T]Stop [I]Infer [J]Stop [Q]Quit")
 
         # 화면 표시
         cv2.imshow("Camera Turret - MuJoCo",
                    np.vstack([world_bgr, cam_bgr]))
 
     # ── 종료 처리 ────────────────────────────────────────────
-    # 레코딩 중 종료 시 현재 에피소드 저장
-    if is_recording and frame_count > 0:
-        dataset.save_episode()
-        print(f"[REC] 종료 시 에피소드 {episode_count} 자동 저장 ({frame_count} frames)")
-        episode_count += 1
-
-    dataset.finalize()
-    print(f"Dataset 확정: 총 {episode_count} 에피소드 저장됨 -> {DATASET_ROOT}")
 
     cap.release()
     renderer.close()

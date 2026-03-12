@@ -174,3 +174,11 @@ We welcome contributions from everyone in the community! To get started, please 
 <div align="center">
 <sub>Built by the <a href="https://huggingface.co/lerobot">LeRobot</a> team at <a href="https://huggingface.co">Hugging Face</a> with ❤️</sub>
 </div>
+
+
+## test code
+
+C:/Users/perpe/miniconda3/envs/lerobot/python.exe examples/tutorial/act/act_custom.py
+C:/Users/perpe/miniconda3/envs/lerobot/python.exe examples/tutorial/act/act_custom_training.py --steps 20 --batch 4
+C:/Users/perpe/miniconda3/envs/lerobot/python.exe examples/tutorial/act/act_custom_replay.py
+C:/Users/perpe/miniconda3/envs/lerobot/python.exe examples/tutorial/act/act_custom_inference.py
