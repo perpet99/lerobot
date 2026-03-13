@@ -1,37 +1,42 @@
-"""
-act_custom 데이터셋으로 ACT Policy 학습 (시계열 이미지 + 각도 변화량)
+"""act_custom 데이터셋으로 SmolVLA Policy 학습 (시계열 이미지 + 각도 변화량)
 
 입력 : observation.images.cam 3프레임 (N-2, N-1, N) + observation.state (현재 각도)
 출력 : 각도 변화량 (N 시점 각도 - N-2 시점 각도)
 
 3장 이미지로 이동방향/속도를 인식하고, 각도 변화량(delta)을 예측.
+SmolVLA는 VLM 백본 + 액션 전문가 모델로 구성된 VLA(Vision-Language-Action) 모델.
+
+사전 설치: pip install -e ".[smolvla]"
 
 사용법
   python examples/tutorial/act/act_custom_training2.py
-  python examples/tutorial/act/act_custom_training2.py --steps 500 --batch 8
+  python examples/tutorial/act/act_custom_training2.py --steps 500 --batch 4
 """
 
+import msvcrt
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import torch
+from transformers import AutoTokenizer
 
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.policies.act.configuration_act import ACTConfig
-from lerobot.policies.act.modeling_act import ACTPolicy
+from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
 
 # ─── 데이터셋 설정 ──────────────────────────────────────────────
 DATASET_REPO_ID = "act_custom/cam_turret"
 DATASET_ROOT = "outputs/act_custom_dataset"
+SINGLE_TASK = "Rotate camera turret to track target"
 
 # ─── 시계열 프레임 수 ────────────────────────────────────────────
 N_TEMPORAL_FRAMES = 3  # N-2, N-1, N
 
 
-def transform_batch(batch: dict, device: torch.device) -> dict:
-    """시계열 데이터를 3개 카메라(=3프레임) 입력 + 각도 변화량 타겟으로 변환.
+def transform_batch(batch: dict, device: torch.device, tokenizer) -> dict:
+    """시계열 데이터를 3개 카메라(=3프레임) 입력 + 각도 변화량 타겟 + 언어 토큰으로 변환.
 
     변환 내용:
       observation.images.cam (B, 3, C, H, W)
@@ -42,6 +47,8 @@ def transform_batch(batch: dict, device: torch.device) -> dict:
         → observation.state (B, state_dim)  현재(N) 각도만
       action
         → (B, 1, state_dim)  각도 변화량 = state[N] - state[N-2]
+      task (list[str])
+        → observation.language.tokens + observation.language.attention_mask
     """
     # 모든 텐서를 device로 이동
     batch = {
@@ -71,9 +78,25 @@ def transform_batch(batch: dict, device: torch.device) -> dict:
     # 현재 각도만 입력으로 사용
     batch["observation.state"] = state_n
 
-    # 액션 = 각도 변화량, chunk_size=1이므로 (B, 1, state_dim)
+    # 학습 타깃은 단일 스텝 delta angle 형태로 맞춘다.
+    print(f"delta_angle shape: {delta_angle.shape}, values: {delta_angle[:2]}")
+    print(f"action shape: {delta_angle.unsqueeze(1).shape}, values: {delta_angle.unsqueeze(1)[:2]}")
+    
     batch["action"] = delta_angle.unsqueeze(1)
     batch["action_is_pad"] = torch.zeros(B, 1, dtype=torch.bool, device=device)
+
+    # ── 태스크 문자열 → 언어 토큰 (SmolVLA 필수 입력) ────────
+    task_texts = batch.pop("task", None)
+    if task_texts is None:
+        task_texts = [SINGLE_TASK + "\n"] * B
+    elif isinstance(task_texts, str):
+        task_texts = [task_texts + "\n"] * B
+    else:
+        task_texts = [t + "\n" if not t.endswith("\n") else t for t in task_texts]
+    tokens = tokenizer(task_texts, padding="longest", padding_side="right",
+                       max_length=48, truncation=True, return_tensors="pt")
+    batch["observation.language.tokens"] = tokens.input_ids.to(device)
+    batch["observation.language.attention_mask"] = tokens.attention_mask.to(device)
 
     # 시계열 관련 _is_pad 키 제거 (policy에서 사용하지 않음)
     for key in list(batch.keys()):
@@ -85,11 +108,11 @@ def transform_batch(batch: dict, device: torch.device) -> dict:
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="ACT Custom Training (Temporal + Delta)")
+    parser = argparse.ArgumentParser(description="SmolVLA Custom Training (Temporal + Delta)")
     parser.add_argument("--steps", type=int, default=100, help="학습 스텝 수")
-    parser.add_argument("--batch", type=int, default=8, help="배치 크기")
-    parser.add_argument("--lr", type=float, default=1e-5, help="학습률")
-    parser.add_argument("--output", type=str, default="outputs/act_custom_training",
+    parser.add_argument("--batch", type=int, default=4, help="배치 크기")
+    parser.add_argument("--lr", type=float, default=1e-4, help="학습률")
+    parser.add_argument("--output", type=str, default="outputs/smolvla_custom_training",
                         help="체크포인트 저장 경로")
     args = parser.parse_args()
 
@@ -120,7 +143,7 @@ def main():
     print(f"  Temporal frames: {N_TEMPORAL_FRAMES} (N-2, N-1, N)")
 
     # ── 커스텀 피처 정의 ─────────────────────────────────────
-    # 3개 시계열 이미지를 독립 카메라처럼 취급 → ACT가 자연스럽게 처리
+    # 3개 시계열 이미지를 독립 카메라처럼 취급 → SmolVLA가 자연스럽게 처리
     input_features = {
         "observation.images.cam_t0": PolicyFeature(type=FeatureType.VISUAL, shape=(img_c, img_h, img_w)),
         "observation.images.cam_t1": PolicyFeature(type=FeatureType.VISUAL, shape=(img_c, img_h, img_w)),
@@ -134,20 +157,36 @@ def main():
     print(f"  Input:  {list(input_features.keys())}")
     print(f"  Output: {list(output_features.keys())} (delta angle)")
 
-    # ── ACT 설정 & 모델 생성 ─────────────────────────────────
-    cfg = ACTConfig(
+    # ── SmolVLA 설정 & 모델 생성 ──────────────────────────────
+    cfg = SmolVLAConfig(
         input_features=input_features,
         output_features=output_features,
         chunk_size=1,            # 단일 스텝 변화량 예측
         n_action_steps=1,
         optimizer_lr=args.lr,
+        load_vlm_weights=True,   # 사전학습된 VLM 백본 사용
     )
-    policy = ACTPolicy(cfg)
+    policy = SmolVLAPolicy(cfg)
+
+    # 토크나이저 초기화 (SmolVLA 태스크 텍스트 → 언어 토큰)
+    tokenizer = AutoTokenizer.from_pretrained(cfg.vlm_model_name)
+
+    # 같은 출력 경로에 저장된 체크포인트가 있으면 이어서 학습한다.
+    pretrained_path = output_directory / "model.safetensors"
+    if pretrained_path.exists():
+        print(f"  기존 모델 발견 → 가중치 로드: {pretrained_path}")
+        pretrained_policy = SmolVLAPolicy.from_pretrained(output_directory)
+        policy.load_state_dict(pretrained_policy.state_dict())
+        del pretrained_policy
+    else:
+        print("  기존 모델 없음 → 새로 학습 시작")
+
     policy.train()
     policy.to(device)
 
-    param_count = sum(p.numel() for p in policy.parameters())
-    print(f"  Model params: {param_count:,}")
+    trainable_count = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+    total_count = sum(p.numel() for p in policy.parameters())
+    print(f"  Model params: {total_count:,} (trainable: {trainable_count:,})")
 
     # ── delta_timestamps 설정 (시계열 데이터 로드) ───────────
     delta_timestamps = {
@@ -167,7 +206,9 @@ def main():
         drop_last=True,
     )
 
-    optimizer = cfg.get_optimizer_preset().build(policy.parameters())
+    optimizer = cfg.get_optimizer_preset().build(
+        [p for p in policy.parameters() if p.requires_grad]
+    )
 
     # ── 학습 루프 ────────────────────────────────────────────
     training_steps = args.steps
@@ -178,13 +219,22 @@ def main():
     print(f"Training: {training_steps} steps, batch={args.batch}, lr={args.lr}")
     print(f"  Input:  3 temporal images (N-2, N-1, N) + current angle")
     print(f"  Output: delta angle (N angle - N-2 angle)")
+    print(f"  Press 'x' to stop training early")
     print(f"{'='*60}\n")
 
     step = 0
     done = False
     while not done:
         for batch in dataloader:
-            batch = transform_batch(batch, device)
+            # x 키 입력 시 학습 종료
+            if msvcrt.kbhit():
+                key = msvcrt.getch()
+                if key in (b'x', b'X'):
+                    print(f"\n  [x] 키 입력 → 학습 조기 종료 (step {step})")
+                    done = True
+                    break
+
+            batch = transform_batch(batch, device, tokenizer)
             loss, _ = policy.forward(batch)
             loss.backward()
             optimizer.step()
@@ -193,11 +243,18 @@ def main():
             loss_val = loss.item()
             loss_history.append(loss_val)
 
-            if step % log_freq == 0:
-                print(f"  step {step:>5d}/{training_steps}  |  loss: {loss_val:.4f}")
+            if step % 10 == 0:
+                target_vals = batch["action"][:, 0, :]   # (B, action_dim)
+                print(f"  step {step:>5d}/{training_steps}  |  loss: {loss_val:.4f}"
+                      f"  |  target: {target_vals[0].tolist()}")
 
             step += 1
             if step >= training_steps:
+                done = True
+                break
+            # 손실이 충분히 작아지면 불필요한 추가 학습을 멈춘다.
+            if loss_val < 0.0001:
+                print(f"\n  loss {loss_val:.6f} < 0.0001 → 학습 조기 종료 (step {step})")
                 done = True
                 break
 
@@ -212,7 +269,7 @@ def main():
     ax.plot(range(1, len(loss_history) + 1), loss_history, linewidth=1.2, color="#2196F3")
     ax.set_xlabel("Step", fontsize=12)
     ax.set_ylabel("Loss", fontsize=12)
-    ax.set_title("ACT Training Loss — Temporal 3-Frame + Delta Angle", fontsize=14)
+    ax.set_title("SmolVLA Training Loss — Temporal 3-Frame + Delta Angle", fontsize=14)
     ax.grid(True, alpha=0.3)
 
     # 이동평균 추가 (10스텝)

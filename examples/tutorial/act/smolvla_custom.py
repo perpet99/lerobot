@@ -1,25 +1,28 @@
 """
-커스텀 MuJoCo 환경: 회전 관절 + 카메라 + 이동 타깃 구체
+커스텀 MuJoCo 환경: 회전 관절 + 카메라 + 비디오 스크린
 
 구성
-    - 회전 가능한 관절(pan) 위에 카메라 장착
-    - 방향키 ← / → : -90° ~ +90° 회전
-    - 카메라 앞쪽에서 빨간 구가 좌우로 반복 이동
+  - 회전 가능한 관절(pan) 위에 카메라 장착
+  - 방향키 ← / → : -90° ~ +90° 회전
+  - 카메라 정면 스크린에 play.mp4 재생
 
 화면 레이아웃 (2×1)
-    ┌──────────────────────┐
-    │   World View         │  <- 씬 전체 조망 (고정 카메라)
-    ├──────────────────────┤
-    │   Camera View        │  <- 관절 위 카메라가 보는 시점
-    └──────────────────────┘
+  ┌──────────────────────┐
+  │   World View         │  <- 씬 전체 조망 (고정 카메라)
+  ├──────────────────────┤
+  │   Camera View        │  <- 관절 위 카메라가 보는 시점
+  └──────────────────────┘
 
 조작
-    <- / ->  : 좌/우 회전 (3도씩, 최대 +-30도)
-    S        : 레코딩 시작
-    E        : 레코딩 종료 (에피소드 저장)
-    I        : 추론 시작 (학습된 모델 로드)
-    J        : 추론 정지
-    ESC / Q  : 종료
+  <- / ->  : 좌/우 회전 (3도씩, 최대 +-30도)
+  S        : 레코딩 시작
+  E        : 레코딩 종료 (에피소드 저장)
+  ESC / Q  : 종료
+
+비디오 합성 방식
+  MuJoCo UV 텍스처 대신, 카메라 투영(pinhole)으로
+  스크린 4 모서리를 2D 픽셀로 변환 -> cv2 원근 변환으로 합성.
+  -> UV 왜곡 없이 정확한 영상 출력.
 """
 
 import logging
@@ -32,31 +35,22 @@ from collections import deque
 import cv2
 import numpy as np
 import mujoco
-import torch
 
-from lerobot.configs.types import FeatureType, PolicyFeature
-from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.policies.act.configuration_act import ACTConfig
-from lerobot.policies.act.modeling_act import ACTPolicy
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+# ─── 경로 / 크기 설정 ───────────────────────────────────────────
+VIDEO_PATH = "examples/tutorial/act/play.mp4"
 
 VIEW_W, VIEW_H = 800, 450      # 각 뷰(world/cam) 렌더 크기
 
-ANGLE_STEP = math.radians(3)   # 키 1회 입력당 회전량
+ANGLE_STEP = math.radians(15)   # 키 1회 입력당 회전량
 MAX_ANGLE  = math.radians(30)  # 최대 회전 +-30도
-TARGET_Y   = 1.4
-TARGET_Z   = 0.9
-TARGET_AMPLITUDE = 1.1
-TARGET_SPEED = 1.6
 
 # ─── 레코딩 설정 ─────────────────────────────────────────────────
-DATASET_REPO_ID = "act_custom2/cam_turret"
-DATASET_ROOT    = "outputs/act_custom2_dataset"
+DATASET_REPO_ID = "act_custom/cam_turret"
+DATASET_ROOT    = "outputs/act_custom_dataset"
 DATASET_FPS     = 10
 SINGLE_TASK     = "Rotate camera turret to track target"
-
-# ─── 추론 설정 ───────────────────────────────────────────────────
-MODEL_PATH      = "outputs/act_custom2_training"
-INFERENCE_FPS   = DATASET_FPS
 
 DATASET_FEATURES = {
     "observation.images.cam": {
@@ -126,12 +120,14 @@ XML = """
       </body>
     </body>
 
-        <!-- 카메라 앞에서 좌우로 움직이는 빨간 구 -->
-        <body name="target_track" pos="0 0 0">
-            <body name="target_ball" pos="0 1.4 0.9">
-                <joint name="target_slide" type="slide" axis="1 0 0" range="-1.2 1.2" damping="0.1"/>
-                <geom name="target_geom" type="sphere" size="0.12" rgba="0.90 0.10 0.10 1"/>
-            </body>
+    <!-- 비디오 스크린 (Y=1.4m 앞, 높이 0.9m) -->
+    <body name="screen_body" pos="0 1.4 0.9">
+      <!-- 검은 테두리 -->
+      <geom type="box" size="2.06 0.025 0.612"
+            rgba="0.06 0.06 0.06 1"/>
+      <!-- 스크린 표면: 어두운 회색 (영상은 2D 합성으로 올림) -->
+      <geom name="screen_surface" type="box" size="2.0 0.010 0.5625"
+            pos="0 -0.012 0" rgba="0.05 0.05 0.05 1"/>
     </body>
 
     <!-- 조망 카메라 -->
@@ -141,6 +137,111 @@ XML = """
   </worldbody>
 </mujoco>
 """
+
+
+# ────────────────────────────────────────────────────────────────
+#  카메라 투영 유틸리티
+# ────────────────────────────────────────────────────────────────
+
+def get_screen_corners_world(model: mujoco.MjModel,
+                             data:  mujoco.MjData) -> np.ndarray:
+    """스크린 표면 geom의 카메라 쪽 면 4 모서리 (월드 좌표, shape=(4,3)).
+
+    순서: [bottom-left, bottom-right, top-right, top-left]
+    """
+    geom_id  = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "screen_surface")
+    body_id  = model.geom_bodyid[geom_id]
+
+    body_pos = data.xpos[body_id].copy()           # (3,)  world 위치
+    body_rot = data.xmat[body_id].reshape(3, 3)    # (3,3) world 회전
+
+    # geom local 위치 / 반-크기
+    lpos  = model.geom_pos[geom_id]    # (0, -0.012, 0)
+    lsize = model.geom_size[geom_id]   # (1.0, 0.010, 0.5625)
+
+    geom_center = body_pos + body_rot @ lpos
+
+    # 카메라 방향(-Y 로컬) 면의 4 모서리
+    hw_x = lsize[0]   # 1.0
+    hw_z = lsize[2]   # 0.5625
+    d_y  = -lsize[1]  # -0.010  (카메라 쪽 면)
+
+    corners_local = np.array([
+        [-hw_x, d_y, -hw_z],   # bottom-left
+        [ hw_x, d_y, -hw_z],   # bottom-right
+        [ hw_x, d_y,  hw_z],   # top-right
+        [-hw_x, d_y,  hw_z],   # top-left
+    ])
+    return np.array([geom_center + body_rot @ c for c in corners_local])
+
+
+def project_to_image(corners_world: np.ndarray,
+                     gl_cam,
+                     view_w: int, view_h: int) -> np.ndarray | None:
+    """월드 3D 모서리 -> 카메라 2D 픽셀 (shape=(4,2), float32).
+
+    MjvGLCamera의 frustum 파라미터로 핀홀 투영.
+    모서리 중 하나라도 카메라 뒤에 있으면 None 반환.
+    """
+    cam_pos = np.array(gl_cam.pos)
+    fwd     = np.array(gl_cam.forward)   # 단위 벡터, 시선 방향
+    up      = np.array(gl_cam.up)        # 단위 벡터, 위쪽
+    right   = np.cross(fwd, up)          # 단위 벡터, 오른쪽
+
+    near = gl_cam.frustum_near
+    # fy = (H/2) * near / frustum_top
+    fy = (view_h / 2.0) * near / gl_cam.frustum_top
+    # 대칭 frustum(frustum_width==0)이면 정방 픽셀 가정: fx == fy
+    fw = gl_cam.frustum_width
+    fx = (view_w / 2.0) * near / fw if fw > 1e-9 else fy
+    cx, cy = view_w / 2.0, view_h / 2.0
+
+    pts = []
+    for p in corners_world:
+        dp    = p - cam_pos
+        depth = float(np.dot(dp, fwd))
+        if depth <= 1e-6:
+            depth = 1e-6                        # 카메라 뒤쪽도 클램핑하여 계속 투영
+        x_c = float(np.dot(dp, right))
+        y_c = float(np.dot(dp, up))
+        u = cx + fx * x_c / depth
+        v = cy - fy * y_c / depth              # 이미지 Y 는 아래 방향
+        pts.append([u, v])
+
+    return np.array(pts, dtype=np.float32)
+
+
+def composite_video(img_bgr:      np.ndarray,
+                    pts_2d:       np.ndarray,
+                    vid_bgr:      np.ndarray) -> np.ndarray:
+    """비디오 프레임을 스크린 4 모서리에 원근 변환하여 합성."""
+    h_v, w_v = vid_bgr.shape[:2]
+    h_i, w_i = img_bgr.shape[:2]
+
+    # 소스: 비디오 프레임 4 모서리 [BL, BR, TR, TL]
+    src = np.float32([
+        [0,   h_v],
+        [w_v, h_v],
+        [w_v, 0  ],
+        [0,   0  ],
+    ])
+    dst = pts_2d  # (4,2) 카메라 이미지 픽셀
+
+    try:
+        M = cv2.getPerspectiveTransform(src, dst)
+    except cv2.error:
+        return img_bgr
+
+    warped = cv2.warpPerspective(vid_bgr, M, (w_i, h_i))
+
+    # 마스크: warpPerspective 한 영역
+    mask_src = np.ones((h_v, w_v), dtype=np.uint8) * 255
+    mask     = cv2.warpPerspective(mask_src, M, (w_i, h_i))
+    _, mask  = cv2.threshold(mask, 128, 255, cv2.THRESH_BINARY)
+
+    result = img_bgr.copy()
+    result[mask > 0] = warped[mask > 0]
+    return result
 
 
 def label(img_bgr: np.ndarray, text: str) -> np.ndarray:
@@ -157,12 +258,19 @@ def label(img_bgr: np.ndarray, text: str) -> np.ndarray:
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
 
+    # 비디오 열기
+    cap = cv2.VideoCapture(VIDEO_PATH)
+    if not cap.isOpened():
+        raise FileNotFoundError(f"play.mp4 열기 실패: {VIDEO_PATH}")
+    vid_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    print(f"Video: {VIDEO_PATH}  "
+          f"{int(cap.get(3))}x{int(cap.get(4))}  {vid_fps:.1f}fps  "
+          f"{int(cap.get(cv2.CAP_PROP_FRAME_COUNT))} frames")
+
     # MuJoCo 초기화
     model = mujoco.MjModel.from_xml_string(XML)
     data  = mujoco.MjData(model)
     pan_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "pan")
-    target_slide_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "target_slide")
-    target_qpos_adr = model.jnt_qposadr[target_slide_id]
 
     renderer = mujoco.Renderer(model, height=VIEW_H, width=VIEW_W)
     mujoco.mj_forward(model, data)
@@ -198,20 +306,13 @@ def main() -> None:
 
     logging.info(f"Dataset initialized: {DATASET_ROOT}")
 
-    # ── 추론 상태 ────────────────────────────────────────────
-    is_inferring = False
-    infer_policy = None
-    infer_device = None
-    infer_frame_buffer = deque(maxlen=3)  # 최근 3프레임 (N-2, N-1, N) 이미지
-    infer_interval = 1.0 / INFERENCE_FPS
-    next_infer_time = 0.0
-    infer_step_count = 0
-
     # 루프 변수
     target_angle  = 0.0
-    start_time = time.monotonic()
+    vid_interval  = 1.0 / vid_fps
+    next_vid_time = time.monotonic()   # 즉시 첫 프레임
+    current_bgr   = None               # 최신 비디오 프레임 (BGR)
 
-    print("\n[조작]  <- -> : 회전  |  S : 레코딩  |  E : 레코딩 종료  |  I : 추론  |  J : 추론정지  |  ESC/Q : 종료\n")
+    print("\n[조작]  <- -> : 회전  |  S : 레코딩  |  E : 레코딩 종료  |  ESC/Q : 종료\n")
 
     while True:
         # 키 입력 (non-blocking)
@@ -239,99 +340,46 @@ def main() -> None:
                 else:
                     dataset.clear_episode_buffer()
                     print("[REC] 레코딩 종료 — 프레임 없음, 저장 안 함")
-        elif key in (ord('i'), ord('I')):
-            if not is_inferring:
-                if not os.path.isdir(MODEL_PATH):
-                    print(f"[INF] 모델 경로 없음: {MODEL_PATH}")
-                else:
-                    try:
-                        if infer_policy is None:
-                            print(f"[INF] 모델 로딩 중: {MODEL_PATH}")
-                            if torch.cuda.is_available():
-                                infer_device = torch.device("cuda")
-                            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                                infer_device = torch.device("mps")
-                            else:
-                                infer_device = torch.device("cpu")
-                            # 학습 시 사용한 피처 정의 재구성
-                            img_c, img_h, img_w = 3, VIEW_H, VIEW_W
-                            state_dim = 1
-                            inf_input_features = {
-                                "observation.images.cam_t0": PolicyFeature(type=FeatureType.VISUAL, shape=(img_c, img_h, img_w)),
-                                "observation.images.cam_t1": PolicyFeature(type=FeatureType.VISUAL, shape=(img_c, img_h, img_w)),
-                                "observation.images.cam_t2": PolicyFeature(type=FeatureType.VISUAL, shape=(img_c, img_h, img_w)),
-                                "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(state_dim,)),
-                            }
-                            inf_output_features = {
-                                "action": PolicyFeature(type=FeatureType.ACTION, shape=(state_dim,)),
-                            }
-                            inf_cfg = ACTConfig(
-                                input_features=inf_input_features,
-                                output_features=inf_output_features,
-                                chunk_size=1,
-                                n_action_steps=1,
-                            )
-                            infer_policy = ACTPolicy(inf_cfg)
-                            infer_policy.load_state_dict(ACTPolicy.from_pretrained(MODEL_PATH).state_dict())
-                            infer_policy.eval()
-                            infer_policy.to(infer_device)
-                            print(f"[INF] 모델 로드 완료 (device={infer_device})")
-                        else:
-                            infer_policy.reset()
-                        infer_frame_buffer.clear()
-                        infer_step_count = 0
-                        is_inferring = True
-                        next_infer_time = time.monotonic()
-                        print("[INF] 추론 시작")
-                    except Exception as e:
-                        print(f"[INF] 모델 로드 실패: {e}")
-        elif key in (ord('j'), ord('J')):
-            if is_inferring:
-                is_inferring = False
-                infer_frame_buffer.clear()
-                print("[INF] 추론 정지")
 
-        # 관절 부드러운 추종 + 빨간 구 좌우 왕복 이동
+        # 관절 부드러운 추종
         cur = data.qpos[pan_id]
         data.qpos[pan_id] += (target_angle - cur) * 0.25
         data.qvel[pan_id]  = 0.0
-        elapsed = time.monotonic() - start_time
-        data.qpos[target_qpos_adr] = TARGET_AMPLITUDE * math.sin(TARGET_SPEED * elapsed)
         mujoco.mj_forward(model, data)
+
+        # 비디오 프레임 갱신 (시간 기반)
         now = time.monotonic()
+        if now >= next_vid_time:
+            ret, frame = cap.read()
+            if not ret:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = cap.read()
+            if ret:
+                current_bgr = frame
+            next_vid_time += vid_interval
 
         # ── World view 렌더 ──────────────────────────────────
         renderer.update_scene(data, camera="world_cam")
         world_bgr = cv2.cvtColor(renderer.render().copy(), cv2.COLOR_RGB2BGR)
 
+        # 스크린 모서리 투영 -> 비디오 합성 (world_cam 시점)
+        if current_bgr is not None:
+            corners_w = get_screen_corners_world(model, data)
+            pts_world = project_to_image(
+                corners_w, renderer.scene.camera[0], VIEW_W, VIEW_H)
+            if pts_world is not None:
+                world_bgr = composite_video(world_bgr, pts_world, current_bgr)
+
         # ── Camera view 렌더 ─────────────────────────────────
         renderer.update_scene(data, camera="cam")
         cam_bgr = cv2.cvtColor(renderer.render().copy(), cv2.COLOR_RGB2BGR)
 
-        # ── 추론: 3프레임 시계열 이미지 + delta angle 예측 ──
-        if is_inferring and infer_policy is not None and now >= next_infer_time:
-            cam_rgb_infer = cv2.cvtColor(cam_bgr, cv2.COLOR_BGR2RGB)
-            cam_tensor = torch.from_numpy(cam_rgb_infer).float() / 255.0  # (H, W, C)
-            cam_tensor = cam_tensor.permute(2, 0, 1)  # (C, H, W)
-            infer_frame_buffer.append(cam_tensor)
-
-            # 3프레임이 모이면 추론 실행
-            if len(infer_frame_buffer) >= 3:
-                with torch.no_grad():
-                    frames = list(infer_frame_buffer)
-                    cur_angle = data.qpos[pan_id]
-                    batch_infer = {
-                        "observation.images.cam_t0": frames[0].unsqueeze(0).to(infer_device),
-                        "observation.images.cam_t1": frames[1].unsqueeze(0).to(infer_device),
-                        "observation.images.cam_t2": frames[2].unsqueeze(0).to(infer_device),
-                        "observation.state": torch.tensor([[cur_angle]], dtype=torch.float32).to(infer_device),
-                    }
-                    action = infer_policy.select_action(batch_infer)
-                    delta = float(action[0, 0].cpu())
-                    target_angle = max(-MAX_ANGLE, min(MAX_ANGLE, cur_angle + delta))
-                    infer_step_count += 1
-
-            next_infer_time = now + infer_interval
+        # 스크린 모서리 투영 -> 비디오 합성 (cam 시점)
+        if current_bgr is not None:
+            pts_cam = project_to_image(
+                corners_w, renderer.scene.camera[0], VIEW_W, VIEW_H)
+            if pts_cam is not None:
+                cam_bgr = composite_video(cam_bgr, pts_cam, current_bgr)
 
         # ── 레코딩: 프레임 저장 (10fps 간격) ────────────────
         if is_recording and now >= next_rec_time:
@@ -358,11 +406,8 @@ def main() -> None:
         # 레이블
         deg = math.degrees(data.qpos[pan_id])
         status = f"  [REC {frame_count}]" if is_recording else ""
-        if is_inferring:
-            status += f"  [INF step={infer_step_count}]"
-        target_x = float(data.qpos[target_qpos_adr])
-        label(world_bgr, f"World View  |  Pan: {deg:+.1f} deg  |  Target X: {target_x:+.2f} m{status}")
-        label(cam_bgr,   "Camera View  |  [<- ->] [S]Rec [E]Stop [I]Infer [J]Stop [Q]Quit")
+        label(world_bgr, f"World View  |  Pan: {deg:+.1f} deg{status}")
+        label(cam_bgr,   "Camera View  |  [<- ->] [S]Rec [E]Stop [Q]Quit")
 
         # 화면 표시
         cv2.imshow("Camera Turret - MuJoCo",
@@ -378,6 +423,7 @@ def main() -> None:
     dataset.finalize()
     print(f"Dataset 확정: 총 {episode_count} 에피소드 저장됨 -> {DATASET_ROOT}")
 
+    cap.release()
     renderer.close()
     cv2.destroyAllWindows()
     print("종료.")
